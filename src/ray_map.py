@@ -140,12 +140,14 @@ class RayMapIterator:
 # ───────────────────────── Core class ─────────────────────────
 
 class RayMap:
+    _RAY_PENDING_QUEUE_LEN = 16
+
     def __init__(
         self,
         fn: Callable,
         *,
         batch_size: int = 1,
-        max_pending: int = -1,            # -1 → авто-настройка: CPU + 16
+        max_pending: int = -1,            # -1 → авто-настройка: CPU + _RAY_PENDING_QUEUE_LEN
         checkpoint_path: Optional[str] = None,
         checkpoint_every: int = 100,
         address: Optional[str] = None,    # "ray://host:port" или None → локальный
@@ -204,7 +206,7 @@ class RayMap:
                     self._remote_safe = _exec_batch_safe.options(**self._remote_options).remote
                 if self.max_pending == -1:
                     cpu = int(ray.available_resources().get("CPU", 1) or 1)
-                    self.max_pending = max(1, cpu + 16)
+                    self.max_pending = int(max(1, cpu + self._RAY_PENDING_QUEUE_LEN))
             return
         if self._ray_initted and ray.is_initialized():
             if self.max_pending == -1:
@@ -212,7 +214,7 @@ class RayMap:
                     cpu = int(ray.available_resources().get("CPU", 1))
                 except Exception:
                     cpu = 1
-                self.max_pending = max(1, cpu + 16)
+                self.max_pending = int(max(1, cpu + self._RAY_PENDING_QUEUE_LEN))
             return
 
         init_kw: Dict[str, Any] = {}
@@ -244,7 +246,7 @@ class RayMap:
                 cpu = int(ray.available_resources().get("CPU", 1))
             except Exception:
                 cpu = 1
-            self.max_pending = max(1, cpu + 16)
+            self.max_pending = int(max(1, cpu + self._RAY_PENDING_QUEUE_LEN))
 
     def _save_ckpt_maybe(self) -> None:
         if not self.checkpoint_path:
