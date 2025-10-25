@@ -172,7 +172,7 @@ class RayMap:
         self._ray_password = password
         self._ray_runtime_env = runtime_env or {}
         self._remote_options = remote_options or {}
-        self._fn_ref: Optional[ray.ObjectRef] = None
+        self._fn_ref: Optional[bytes] = None
         self._remote_safe: Optional[Callable] = None
 
         # checkpoint state
@@ -201,7 +201,7 @@ class RayMap:
             if not self._ray_initted:
                 self._ray_initted = True
                 if self._fn_ref is None:
-                    self._fn_ref = ray.put(cloudpickle.dumps(self.fn))
+                    self._fn_ref = cloudpickle.dumps(self.fn)
                 if self._remote_safe is None:
                     self._remote_safe = _exec_batch_safe.options(**self._remote_options).remote
                 if self.max_pending == -1:
@@ -238,7 +238,7 @@ class RayMap:
             else:
                 raise
         self._ray_initted = True
-        self._fn_ref = ray.put(cloudpickle.dumps(self.fn))
+        self._fn_ref = cloudpickle.dumps(self.fn)
         self._remote_safe = _exec_batch_safe.options(**self._remote_options).remote
 
         if self.max_pending == -1:
