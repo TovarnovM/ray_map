@@ -50,6 +50,7 @@ from __future__ import annotations
 import os
 import pickle
 import hashlib
+import time
 import cloudpickle
 import asyncio
 import threading
@@ -520,3 +521,269 @@ class RayMap:
         async for item in r.imap_async(iterable, safe_exceptions=True, keep_order=True, ret_args=True):
             out.append(item)
         return out
+
+
+    def imap_stream(
+        self,
+        iterable: Iterable[Any],
+        *,
+        timeout: Optional[float] = None,
+        safe_exceptions: bool = False,
+        ret_args: bool = False,
+        keep_order: bool = False,
+        ordered_window: Optional[int] = None,   # максимум буфера для «сохранения порядка»
+        limit: Optional[int] = None,            # остановиться после N элементов (для «бесконечных»)
+        time_budget: Optional[float] = None,    # секунд на обработку; по истечении — стоп
+        stop: Optional[Callable[[], bool] | threading.Event] = None,  # внешняя «кнопка стоп»
+        max_pending: Optional[int] = None,      # переопределить self.max_pending для этого вызова
+    ) -> Iterator[Any]:
+        """
+        Потоковая версия для бесконечных / очень длинных итераторов.
+        - НЕ материализует вход.
+        - Ленивый реплей чекпоинта: для каждого arg сразу проверяем кеш и при наличии
+        сразу отдаём результат (и не шлём в кластер).
+        - По умолчанию отдаёт «по готовности» (keep_order=False). Если нужен порядок,
+        включите keep_order=True. Чтобы не росла память, задайте ordered_window (например 10_000).
+        - Условия остановки: limit, time_budget, stop.
+        """
+        # Готовим Ray / удалённые ссылки
+        self._ensure_ray()
+        assert self._remote_safe is not None and self._fn_ref is not None
+
+        pending: List[_Pending] = []
+        batch_buf: List[Tuple[int, Any]] = []
+        delivered = 0
+        start = time.perf_counter()
+        next_idx = 0
+
+        # Буфер для упорядоченной выдачи
+        buf: Dict[int, Tuple[Any, Any]] = {}
+        want_idx = 0
+
+        _max_pending = max_pending if max_pending is not None else self.max_pending
+        stopped_by: Optional[str] = None  # 'limit' | 'time' | 'external' | None
+
+        def _stop_reason() -> Optional[str]:
+            # Важен порядок: limit должен срабатывать первым
+            if limit is not None and delivered >= limit:
+                return 'limit'
+            if time_budget is not None and (time.perf_counter() - start) >= time_budget:
+                return 'time'
+            if isinstance(stop, threading.Event):
+                return 'external' if stop.is_set() else None
+            if callable(stop):
+                try:
+                    return 'external' if stop() else None
+                except Exception:
+                    return 'external'
+            return None
+
+        def _submit_batch_if_any() -> None:
+            nonlocal batch_buf
+            if not batch_buf:
+                return
+            idxs = [i for (i, _a) in batch_buf]
+            args = [a for (_i, a) in batch_buf]
+            ref = self._remote_safe(self._fn_ref, args, timeout)
+            pending.append(_Pending(ref=ref, idxs=idxs, args=args))
+            batch_buf = []
+
+        def _emit(a: Any, r: Any) -> Iterator[Any]:
+            nonlocal delivered
+            if not safe_exceptions and isinstance(r, Exception):
+                raise r
+            nonlocal stopped_by
+            if limit is not None and delivered >= limit:
+                stopped_by = 'limit'
+                return
+            yield (a, r) if ret_args else r
+            delivered += 1
+
+        def _drain_one_ready(allow_yield: bool = True) -> Iterator[Any]:
+            """Снять один готовый батч. При keep_order+ordered_window, если окно
+            переполнено и следующего нужного индекса ещё нет — продолжаем ждать
+            другие готовые батчи, пока не сможем выдать want_idx. Если allow_yield=False,
+            только обновляем чекпоинт/буферы, наружу не отдаём (для stop/limit)."""
+            nonlocal want_idx, buf, delivered
+
+            ready_refs, _ = ray.wait([p.ref for p in pending], num_returns=1)
+            ready_ref = ready_refs[0]
+            j = next(i for i, p in enumerate(pending) if p.ref == ready_ref)
+            pend = pending.pop(j)
+            try:
+                results: List[Any] = ray.get(ready_ref)
+            except Exception as e:
+                results = [e] * len(pend.args)
+
+            for idx, arg, res in zip(pend.idxs, pend.args, results):
+                # чекпоинт
+                k = _arg_key(arg)
+                self._completed_keys.add(k)
+                self._results_for_ckpt.append((k, arg, res))
+                self._ckpt_by_key[k] = (arg, res)
+                self._save_ckpt_maybe()
+
+                if keep_order:
+                    buf[idx] = (arg, res)
+                    if stopped_by == 'limit':
+                        continue
+                    # Если окно > ordered_window и next нужного индекса ещё нет — ждём ещё готовых
+                    while ordered_window is not None and len(buf) > ordered_window and want_idx not in buf and pending:
+                        ready_refs2, _ = ray.wait([p.ref for p in pending], num_returns=1)
+                        ready_ref2 = ready_refs2[0]
+                        j2 = next(ii for ii, pp in enumerate(pending) if pp.ref == ready_ref2)
+                        pend2 = pending.pop(j2)
+                        try:
+                            results2: List[Any] = ray.get(ready_ref2)
+                        except Exception as e2:
+                            results2 = [e2] * len(pend2.args)
+                        for idx2, arg2, res2 in zip(pend2.idxs, pend2.args, results2):
+                            k2 = _arg_key(arg2)
+                            self._completed_keys.add(k2)
+                            self._results_for_ckpt.append((k2, arg2, res2))
+                            self._ckpt_by_key[k2] = (arg2, res2)
+                            self._save_ckpt_maybe()
+                            buf[idx2] = (arg2, res2)
+
+                    # Выдаём подряд всё, что можем
+                    while want_idx in buf and allow_yield and stopped_by != 'limit':
+                        a, r = buf.pop(want_idx)
+                        for y in _emit(a, r):
+                            yield y
+                        want_idx += 1
+                else:
+                    if allow_yield and stopped_by != 'limit':
+                        for y in _emit(arg, res):
+                            yield y
+                    else:
+                        pass  # discard path
+
+        # Основной цикл — читаем вход лениво
+        for arg in iterable:
+            reason = _stop_reason()
+            if reason is not None:
+                stopped_by = reason
+                break
+
+            # ленивый реплей из чекпоинта
+            k = _arg_key(arg)
+            cached = self._ckpt_by_key.get(k)
+            if cached is not None:
+                _a, res = cached
+                if keep_order:
+                    buf[next_idx] = (arg, res)
+                    while want_idx in buf:
+                        a, r = buf.pop(want_idx)
+                        for y in _emit(a, r):
+                            yield y
+                        want_idx += 1
+                else:
+                    for y in _emit(arg, res):
+                        yield y
+                next_idx += 1
+                continue
+
+            # аккумулируем батч
+            batch_buf.append((next_idx, arg))
+            next_idx += 1
+            if len(batch_buf) >= self.batch_size:
+                _submit_batch_if_any()
+
+            # back-pressure: если переполнены — снимаем готовое
+            while len(pending) >= _max_pending:
+                reason2 = _stop_reason()
+                if reason2 is not None:
+                    stopped_by = reason2
+                    if reason2 in ('limit', 'external'):
+                        # снимаем без отдачи — не увеличиваем delivered
+                        for _ in _drain_one_ready(allow_yield=False):
+                            pass
+                    else:  # 'time'
+                        if stopped_by == 'limit':
+                            # на всякий случай, не выдаём больше элементов
+                            for _ in _drain_one_ready(allow_yield=False): pass
+                        for y in _drain_one_ready(allow_yield=True):
+                            yield y
+                    break
+                else:
+                    for y in _drain_one_ready(allow_yield=True):
+                        yield y
+
+        # отправим хвост батча, если есть
+        _submit_batch_if_any()
+
+        # финальный дренаж
+        if pending:
+            if stopped_by is None:
+                # обычное завершение — полностью дренируем
+                while pending:
+                    for y in _drain_one_ready(allow_yield=True):
+                        yield y
+            elif stopped_by == 'time':
+                # мягкий дренаж: оставим не больше 1 батча
+                while len(pending) > 1:
+                    for y in _drain_one_ready(allow_yield=True):
+                        yield y
+            else:
+                # limit / external — ничего не выдаём, лишь чуть разгрузим
+                while len(pending) > 1:
+                    for _ in _drain_one_ready(allow_yield=False):
+                        pass
+
+        # финальный чекпоинт
+        self._flush_ckpt()
+
+
+
+    async def imap_stream_async(
+        self,
+        iterable: Iterable[Any],
+        *,
+        timeout: Optional[float] = None,
+        safe_exceptions: bool = False,
+        ret_args: bool = False,
+        keep_order: bool = False,
+        ordered_window: Optional[int] = None,
+        limit: Optional[int] = None,
+        time_budget: Optional[float] = None,
+        stop: Optional[Callable[[], bool] | threading.Event] = None,
+        max_pending: Optional[int] = None,
+        queue_maxsize: int = 1000,
+    ) -> AsyncIterator[Any]:
+        """
+        Async-версия imap_stream: запускает синхронный поток в отдельном потоке и
+        прокидывает через asyncio.Queue (ивент-луп не блокируется).
+        """
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue(queue_maxsize)
+        sentinel = object()
+
+        def _producer() -> None:
+            try:
+                for item in self.imap_stream(
+                    iterable,
+                    timeout=timeout,
+                    safe_exceptions=safe_exceptions,
+                    ret_args=ret_args,
+                    keep_order=keep_order,
+                    ordered_window=ordered_window,
+                    limit=limit,
+                    time_budget=time_budget,
+                    stop=stop,
+                    max_pending=max_pending,
+                ):
+                    fut = asyncio.run_coroutine_threadsafe(q.put(item), loop)
+                    try:
+                        fut.result()
+                    except Exception:
+                        break
+            finally:
+                asyncio.run_coroutine_threadsafe(q.put(sentinel), loop).result()
+
+        threading.Thread(target=_producer, daemon=True).start()
+
+        while True:
+            item = await q.get()
+            if item is sentinel:
+                break
+            yield item
